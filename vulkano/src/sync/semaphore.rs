@@ -88,7 +88,14 @@ pub struct Semaphore {
     semaphore_type: SemaphoreType,
     export_handle_types: ExternalSemaphoreHandleTypes,
 
-    must_put_in_pool: bool,
+    drop_action: SemaphoreDropAction,
+}
+
+#[derive(Debug)]
+enum SemaphoreDropAction {
+    Drop,
+    PutInPool,
+    Leak,
 }
 
 impl Semaphore {
@@ -159,13 +166,13 @@ impl Semaphore {
                 semaphore_type: SemaphoreType::Binary,
                 export_handle_types: ExternalSemaphoreHandleTypes::empty(),
 
-                must_put_in_pool: true,
+                drop_action: SemaphoreDropAction::PutInPool,
             },
             None => {
                 // Pool is empty, alloc new semaphore
                 let mut semaphore =
                     unsafe { Semaphore::new_unchecked(device, Default::default()) }?;
-                semaphore.must_put_in_pool = true;
+                semaphore.drop_action = SemaphoreDropAction::PutInPool;
                 semaphore
             }
         };
@@ -200,7 +207,38 @@ impl Semaphore {
             semaphore_type,
             export_handle_types,
 
-            must_put_in_pool: false,
+            drop_action: SemaphoreDropAction::Leak,
+        }
+    }
+
+    /// Creates a new `Semaphore` from a raw object handle, without owning it.
+    ///
+    /// # Safety
+    ///
+    /// - `handle` must be a valid Vulkan object handle created from `device`.
+    /// - `create_info` must match the info used to create the object.
+    /// - `handle` must not be destroyed while the returned `Semaphore` is alive.
+    pub unsafe fn from_handle_borrowed(
+        device: Arc<Device>,
+        handle: ash::vk::Semaphore,
+        create_info: SemaphoreCreateInfo,
+    ) -> Semaphore {
+        let SemaphoreCreateInfo {
+            semaphore_type,
+            initial_value: _,
+            export_handle_types,
+            _ne: _,
+        } = create_info;
+
+        Semaphore {
+            handle,
+            device: InstanceOwnedDebugWrapper(device),
+            id: Self::next_id(),
+
+            semaphore_type,
+            export_handle_types,
+
+            drop_action: SemaphoreDropAction::Drop,
         }
     }
 
@@ -1033,12 +1071,18 @@ impl Semaphore {
 impl Drop for Semaphore {
     #[inline]
     fn drop(&mut self) {
-        if self.must_put_in_pool {
-            let raw_sem = self.handle;
-            self.device.semaphore_pool().lock().push(raw_sem);
-        } else {
-            let fns = self.device.fns();
-            unsafe { (fns.v1_0.destroy_semaphore)(self.device.handle(), self.handle, ptr::null()) };
+        match self.drop_action {
+            SemaphoreDropAction::Leak => {}
+            SemaphoreDropAction::Drop => {
+                let fns = self.device.fns();
+                unsafe {
+                    (fns.v1_0.destroy_semaphore)(self.device.handle(), self.handle, ptr::null())
+                };
+            }
+            SemaphoreDropAction::PutInPool => {
+                let raw_sem = self.handle;
+                self.device.semaphore_pool().lock().push(raw_sem);
+            }
         }
     }
 }
