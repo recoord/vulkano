@@ -44,6 +44,8 @@ pub struct ImageView {
     format_features: FormatFeatures,
     filter_cubic: bool,
     filter_cubic_minmax: bool,
+
+    ownership: ImageViewOwnership,
 }
 
 impl ImageView {
@@ -589,7 +591,9 @@ impl ImageView {
             unsafe { output.assume_init() }
         };
 
-        unsafe { Self::from_handle(image, handle, create_info) }
+        unsafe {
+            Self::from_handle_with_ownership(image, handle, create_info, ImageViewOwnership::Owned)
+        }
     }
 
     /// Creates a default `ImageView`. Equivalent to
@@ -610,6 +614,48 @@ impl ImageView {
         image: Arc<Image>,
         handle: ash::vk::ImageView,
         create_info: ImageViewCreateInfo,
+    ) -> Result<Arc<Self>, VulkanError> {
+        unsafe {
+            Self::from_handle_with_ownership(image, handle, create_info, ImageViewOwnership::Owned)
+        }
+    }
+
+    /// Creates a new `ImageView` from a raw object handle. Unlike `from_handle`, the created
+    /// `ImageView` will not destroy the inner image view when dropped.
+    ///
+    /// # Safety
+    ///
+    /// - `handle` must be a valid Vulkan object handle created from `image`.
+    /// - `create_info` must match the info used to create the object.
+    /// -  Caller must ensure the handle will not be destroyed for the lifetime of returned
+    ///   `ImageView`. The `object` parameter can be used to ensure this.
+    pub unsafe fn from_handle_borrowed(
+        image: Arc<Image>,
+        handle: ash::vk::ImageView,
+        create_info: ImageViewCreateInfo,
+        object: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Arc<Self>, VulkanError> {
+        unsafe {
+            Self::from_handle_with_ownership(
+                image,
+                handle,
+                create_info,
+                ImageViewOwnership::Borrowed(object),
+            )
+        }
+    }
+
+    /// Creates a new `ImageView` from a raw object handle.
+    ///
+    /// # Safety
+    ///
+    /// - `handle` must be a valid Vulkan object handle created from `image`.
+    /// - `create_info` must match the info used to create the object.
+    unsafe fn from_handle_with_ownership(
+        image: Arc<Image>,
+        handle: ash::vk::ImageView,
+        create_info: ImageViewCreateInfo,
+        ownership: ImageViewOwnership,
     ) -> Result<Arc<Self>, VulkanError> {
         let ImageViewCreateInfo {
             view_type,
@@ -672,6 +718,7 @@ impl ImageView {
             format_features,
             filter_cubic,
             filter_cubic_minmax,
+            ownership,
         }))
     }
 
@@ -740,12 +787,26 @@ impl ImageView {
     }
 }
 
+#[derive(Debug)]
+enum ImageViewOwnership {
+    Owned,
+    Borrowed(Option<Arc<dyn std::any::Any + Send + Sync>>),
+}
+
 impl Drop for ImageView {
     #[inline]
     fn drop(&mut self) {
-        let device = self.device();
-        let fns = device.fns();
-        unsafe { (fns.v1_0.destroy_image_view)(device.handle(), self.handle, ptr::null()) };
+        match &self.ownership {
+            ImageViewOwnership::Owned => {
+                let device = self.device();
+                let fns = device.fns();
+                unsafe { (fns.v1_0.destroy_image_view)(device.handle(), self.handle, ptr::null()) };
+            }
+            ImageViewOwnership::Borrowed(object) => {
+                // this bit is pointless and only exists to silience a dead_code warning from cargo
+                let _to_be_release = object;
+            }
+        }
     }
 }
 
