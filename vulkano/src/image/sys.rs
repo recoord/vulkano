@@ -70,7 +70,7 @@ pub struct RawImage {
 
     memory_requirements: SmallVec<[MemoryRequirements; 4]>,
     sparse_memory_requirements: Vec<SparseImageMemoryRequirements>,
-    needs_destruction: bool, // `vkDestroyImage` is called only if true.
+    ownership: ImageOwnership, // `vkDestroyImage` is called only if owned
     subresource_layout: OnceCache<(ImageAspect, u32, u32), SubresourceLayout>,
 }
 
@@ -145,7 +145,9 @@ impl RawImage {
         handle: ash::vk::Image,
         create_info: ImageCreateInfo,
     ) -> Result<Self, VulkanError> {
-        unsafe { Self::from_handle_with_destruction(device, handle, create_info, true) }
+        unsafe {
+            Self::from_handle_with_ownership(device, handle, create_info, ImageOwnership::Owned)
+        }
     }
 
     /// Creates a new `RawImage` from a raw object handle. Unlike `from_handle`, the created
@@ -158,21 +160,29 @@ impl RawImage {
     /// - If the image has memory bound to it, `bind_memory` must not be called on the returned
     ///   `RawImage`.
     /// - Caller must ensure the handle will not be destroyed for the lifetime of returned
-    ///   `RawImage`.
+    ///   `RawImage`. The `object` parameter can be used to ensure this.
     #[inline]
     pub unsafe fn from_handle_borrowed(
         device: Arc<Device>,
         handle: ash::vk::Image,
         create_info: ImageCreateInfo,
+        object: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Self, VulkanError> {
-        unsafe { Self::from_handle_with_destruction(device, handle, create_info, false) }
+        unsafe {
+            Self::from_handle_with_ownership(
+                device,
+                handle,
+                create_info,
+                ImageOwnership::Borrowed(object),
+            )
+        }
     }
 
-    pub(super) unsafe fn from_handle_with_destruction(
+    pub(super) unsafe fn from_handle_with_ownership(
         device: Arc<Device>,
         handle: ash::vk::Image,
         create_info: ImageCreateInfo,
-        needs_destruction: bool,
+        ownership: ImageOwnership,
     ) -> Result<Self, VulkanError> {
         let ImageCreateInfo {
             flags,
@@ -217,26 +227,29 @@ impl RawImage {
             format_properties.format_features(tiling, &drm_format_modifiers)
         };
 
-        let memory_requirements = if needs_destruction {
-            if flags.intersects(ImageCreateFlags::DISJOINT) {
-                // VUID-VkImageMemoryRequirementsInfo2-image-01589
-                // VUID-VkImageMemoryRequirementsInfo2-image-02279
-                let plane_count = drm_format_modifier.map_or_else(
-                    || format.planes().len(),
-                    |(_, plane_count)| plane_count as usize,
-                );
+        let memory_requirements = match ownership {
+            ImageOwnership::Owned => {
+                if flags.intersects(ImageCreateFlags::DISJOINT) {
+                    // VUID-VkImageMemoryRequirementsInfo2-image-01589
+                    // VUID-VkImageMemoryRequirementsInfo2-image-02279
+                    let plane_count = drm_format_modifier.map_or_else(
+                        || format.planes().len(),
+                        |(_, plane_count)| plane_count as usize,
+                    );
 
-                (0..plane_count)
-                    .map(|plane| unsafe {
-                        Self::get_memory_requirements(&device, handle, Some((plane, tiling)))
-                    })
-                    .collect()
-            } else {
-                // VUID-VkImageMemoryRequirementsInfo2-image-01590
-                smallvec![unsafe { Self::get_memory_requirements(&device, handle, None) }]
+                    (0..plane_count)
+                        .map(|plane| unsafe {
+                            Self::get_memory_requirements(&device, handle, Some((plane, tiling)))
+                        })
+                        .collect()
+                } else {
+                    // VUID-VkImageMemoryRequirementsInfo2-image-01590
+                    smallvec![unsafe { Self::get_memory_requirements(&device, handle, None) }]
+                }
             }
-        } else {
-            smallvec![]
+            ImageOwnership::Borrowed(_) => {
+                smallvec![]
+            }
         };
 
         let sparse_memory_requirements = if flags
@@ -271,7 +284,7 @@ impl RawImage {
 
             memory_requirements,
             sparse_memory_requirements,
-            needs_destruction,
+            ownership,
             subresource_layout: OnceCache::new(),
         })
     }
@@ -1468,15 +1481,25 @@ impl RawImage {
     }
 }
 
+#[derive(Debug)]
+pub(super) enum ImageOwnership {
+    Owned,
+    Borrowed(Option<Arc<dyn std::any::Any + Send + Sync>>),
+}
+
 impl Drop for RawImage {
     #[inline]
     fn drop(&mut self) {
-        if !self.needs_destruction {
-            return;
+        match &self.ownership {
+            ImageOwnership::Owned => {
+                let fns = self.device.fns();
+                unsafe { (fns.v1_0.destroy_image)(self.device.handle(), self.handle, ptr::null()) };
+            }
+            ImageOwnership::Borrowed(object) => {
+                // this bit is pointless and only exists to silience a dead_code warning from cargo
+                let _to_be_release = object;
+            }
         }
-
-        let fns = self.device.fns();
-        unsafe { (fns.v1_0.destroy_image)(self.device.handle(), self.handle, ptr::null()) };
     }
 }
 

@@ -224,11 +224,11 @@ impl Image {
         };
 
         let image = unsafe {
-            RawImage::from_handle_with_destruction(
+            RawImage::from_handle_with_ownership(
                 swapchain.device().clone(),
                 handle,
                 create_info,
-                false,
+                sys::ImageOwnership::Borrowed(None),
             )
         }?;
 

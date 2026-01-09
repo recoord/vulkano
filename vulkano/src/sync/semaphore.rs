@@ -88,14 +88,14 @@ pub struct Semaphore {
     semaphore_type: SemaphoreType,
     export_handle_types: ExternalSemaphoreHandleTypes,
 
-    drop_action: SemaphoreDropAction,
+    ownership: SemaphoreOwnership,
 }
 
 #[derive(Debug)]
-enum SemaphoreDropAction {
-    Drop,
-    PutInPool,
-    Leak,
+enum SemaphoreOwnership {
+    Owned,
+    Pooled,
+    Borrowed(Option<Arc<dyn std::any::Any + Send + Sync>>),
 }
 
 impl Semaphore {
@@ -166,13 +166,13 @@ impl Semaphore {
                 semaphore_type: SemaphoreType::Binary,
                 export_handle_types: ExternalSemaphoreHandleTypes::empty(),
 
-                drop_action: SemaphoreDropAction::PutInPool,
+                ownership: SemaphoreOwnership::Pooled,
             },
             None => {
                 // Pool is empty, alloc new semaphore
                 let mut semaphore =
                     unsafe { Semaphore::new_unchecked(device, Default::default()) }?;
-                semaphore.drop_action = SemaphoreDropAction::PutInPool;
+                semaphore.ownership = SemaphoreOwnership::Pooled;
                 semaphore
             }
         };
@@ -207,7 +207,7 @@ impl Semaphore {
             semaphore_type,
             export_handle_types,
 
-            drop_action: SemaphoreDropAction::Leak,
+            ownership: SemaphoreOwnership::Owned,
         }
     }
 
@@ -218,10 +218,13 @@ impl Semaphore {
     /// - `handle` must be a valid Vulkan object handle created from `device`.
     /// - `create_info` must match the info used to create the object.
     /// - `handle` must not be destroyed while the returned `Semaphore` is alive.
+    ///    The `object` parameter can be used to ensure this.
+
     pub unsafe fn from_handle_borrowed(
         device: Arc<Device>,
         handle: ash::vk::Semaphore,
         create_info: SemaphoreCreateInfo,
+        object: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Semaphore {
         let SemaphoreCreateInfo {
             semaphore_type,
@@ -238,7 +241,7 @@ impl Semaphore {
             semaphore_type,
             export_handle_types,
 
-            drop_action: SemaphoreDropAction::Drop,
+            ownership: SemaphoreOwnership::Borrowed(object),
         }
     }
 
@@ -1071,17 +1074,20 @@ impl Semaphore {
 impl Drop for Semaphore {
     #[inline]
     fn drop(&mut self) {
-        match self.drop_action {
-            SemaphoreDropAction::Leak => {}
-            SemaphoreDropAction::Drop => {
+        match &self.ownership {
+            SemaphoreOwnership::Owned => {
                 let fns = self.device.fns();
                 unsafe {
                     (fns.v1_0.destroy_semaphore)(self.device.handle(), self.handle, ptr::null())
                 };
             }
-            SemaphoreDropAction::PutInPool => {
+            SemaphoreOwnership::Pooled => {
                 let raw_sem = self.handle;
                 self.device.semaphore_pool().lock().push(raw_sem);
+            }
+            SemaphoreOwnership::Borrowed(object) => {
+                // this bit is pointless and only exists to silience a dead_code warning from cargo
+                let _to_be_released = object;
             }
         }
     }
